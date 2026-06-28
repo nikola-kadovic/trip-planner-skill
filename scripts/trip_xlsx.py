@@ -58,6 +58,7 @@ import sys
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 # ── Palette ──────────────────────────────────────────────────────────────────
 # Override any of these after import if a trip wants a different look:
@@ -69,6 +70,11 @@ ACCENT = "C9A227"      # emphasis (e.g. per-person row)
 WHITE = "FFFFFF"
 CHOSEN = "FBF3D5"      # highlight fill for the recommended/chosen row
 NOTE_GRAY = "F2F2F2"   # subtle fill for note/estimate rows
+# The glyph the user puts in a "Choose" column to pick which option (hotel,
+# flight, …) feeds the Trip Summary total. Driven by a dropdown + SUMIF lookup
+# (see choose_validation / chosen_total below), so switching the pick is a
+# one-click change that recalculates the total — no formula editing.
+CHOSEN_MARK = "✓"
 
 # ── Font colors (text, not fills) ────────────────────────────────────────────
 C_TEXT = "000000"      # default text / formulas
@@ -287,6 +293,76 @@ def borders(ws, r1, c1, r2, c2):
 def highlight_row(ws, r, c1, c2, color=CHOSEN):
     """Mark the chosen/recommended option row."""
     fill_row(ws, r, c1, c2, color)
+
+# ── Choose-an-option mechanism (marker column + lookup) ──────────────────────
+# A segment (a city's hotels, the flights for a leg, …) lists several options,
+# one per row. A "Choose" column lets the user mark exactly one row; the Trip
+# Summary pulls *that* row's total via SUMIF, so picking a different option is a
+# one-click change that recalculates the whole trip — no formula editing.
+#
+# Build it in three steps:
+#   1. choose_validation(ws, r1, r2, c)         → dropdown on the marker cells
+#   2. put CHOSEN_MARK in the recommended row's marker cell (pre-select it) and
+#      highlight_row() that row so the recommended pick is visible by default
+#   3. on Trip Summary: chosen_total(value_rng, marker_rng, sheet="Hotels")
+#      → a SUMIF that totals whichever row is marked
+def choose_validation(ws, r1, r2, c, *, marker=CHOSEN_MARK):
+    """Add a one-option dropdown (marker, or blank) to the Choose-column cells in
+    rows r1..r2 of column c. The dropdown keeps the user to a valid marker and
+    makes the column obviously interactive. Returns the DataValidation."""
+    col = get_column_letter(c) if isinstance(c, int) else c
+    dv = DataValidation(type="list", formula1=f'"{marker}"', allow_blank=True)
+    dv.prompt = "Pick one option for this segment — it feeds the Trip Summary total."
+    dv.promptTitle = "Choose this option"
+    dv.add(f"{col}{r1}:{col}{r2}")
+    ws.add_data_validation(dv)
+    return dv
+
+
+def choose_mark(ws, r, c, *, marker=CHOSEN_MARK):
+    """Write the chosen marker into a Choose cell (centered). Use on the
+    recommended row so the workbook opens with a valid default selection."""
+    return cell(ws, r, c, marker, align="center", bold=True, color=C_XREF)
+
+
+def _rng(value_range, sheet=None):
+    return f"'{sheet}'!{value_range}" if sheet else value_range
+
+
+def chosen_total(value_range, marker_range, *, sheet=None, marker=CHOSEN_MARK):
+    """Return a SUMIF formula that totals the value of whichever row is marked in
+    the Choose column. Only one row should be marked, so the SUM is that row's
+    value; switching the mark re-points the total automatically.
+
+        # On Trip Summary, pull the chosen Paris hotel's home-currency total:
+        tx.formula(ws, r, c,
+            tx.chosen_total("$I$4:$I$8", "$J$4:$J$8", sheet="Hotels"),
+            color=tx.C_XREF)
+
+    `value_range` / `marker_range` are A1 ranges (use $ to keep them absolute).
+    Pass `sheet` when the lookup lives on a different tab than the data."""
+    vr = _rng(value_range, sheet)
+    mr = _rng(marker_range, sheet)
+    return f'=SUMIF({mr},"{marker}",{vr})'
+
+
+def chosen_label(value_range, marker_range, *, sheet=None, marker=CHOSEN_MARK):
+    """Like chosen_total but returns the *text* (e.g. the chosen property/airline
+    name) of the marked row, via INDEX/MATCH. Handy for echoing the current pick
+    into the Trip Summary's Details column so it updates with the marker. (Uses
+    INDEX/MATCH, not XLOOKUP, so it recalculates in Excel and LibreOffice alike.)"""
+    vr = _rng(value_range, sheet)
+    mr = _rng(marker_range, sheet)
+    return f'=INDEX({vr},MATCH("{marker}",{mr},0))'
+
+
+# ── Per-person figures ───────────────────────────────────────────────────────
+def per_person(total_cell, travelers_cell):
+    """Return a formula dividing a group total by the travelers count, e.g.
+    per_person("F12", "$C$4") → '=F12/$C$4'. Use to add a per-person column that
+    sits *before* the group total so a single flight/room/seat price reads at a
+    glance. travelers_cell should be absolute ($) so it survives fill-down."""
+    return f"={total_cell}/{travelers_cell}"
 
 
 # ── Link-coverage audit ──────────────────────────────────────────────────────
