@@ -400,6 +400,167 @@ def audit_links(wb_or_path, checks):
     return missing
 
 
+# ── Live link sanity check ───────────────────────────────────────────────────
+# audit_links() only proves a link EXISTS. check_links() proves each one actually
+# RESOLVES: it fetches every hyperlink and classifies the result. The wrinkle is
+# that the big booking sites (Booking.com, Expedia, Tripadvisor, lastminute.com,
+# and friends) routinely answer automated requests with 403/429/503 or a timeout
+# even though the URL is perfectly good in a real browser — so a naive "anything
+# that isn't 200 is broken" check would cry wolf. We therefore split the verdict
+# three ways:
+#   • ok      — reachable, and the page does not read as a dead / "not found" page
+#   • blocked — refused by a known bot-blocking travel domain (nothing to fix; the
+#               link is fine for the human who clicks it)
+#   • broken  — genuinely wrong: DNS / connection failure, 404 / 410, a 5xx, or a
+#               200 whose CONTENT says the page is gone ("page not found", etc.)
+# Only "broken" links need a fix-task; "blocked" links are reported but accepted.
+
+BOT_BLOCKING_DOMAINS = (
+    "booking.com", "expedia.", "tripadvisor.", "lastminute.com", "hotels.com",
+    "airbnb.", "agoda.", "kayak.", "vrbo.", "skyscanner.", "getyourguide.",
+    "viator.", "google.com/travel",
+)
+
+# Strong "this page is dead" phrases. Matched against the <title> first (error
+# pages almost always say it there) and then the first few KB of the body, so a
+# 200-with-an-error-page (a "soft 404") is still caught.
+SOFT_404_MARKERS = (
+    "page not found", "404 not found", "page you requested could not be found",
+    "page you were looking for", "no longer available", "is not available",
+    "this page doesn't exist", "this page does not exist", "page cannot be found",
+    "page can't be found", "we couldn't find", "could not be found",
+    "sorry, we can't find", "no results found",
+)
+
+
+def _host_blocks_bots(url):
+    u = (url or "").lower()
+    return any(d in u for d in BOT_BLOCKING_DOMAINS)
+
+
+def _soft_404_reason(body):
+    """Return the dead-page phrase found in the page, or None. Prefers the
+    <title>; falls back to the first 4 KB of the body."""
+    if not body:
+        return None
+    low = body.lower()
+    m = re.search(r"<title[^>]*>(.*?)</title>", low, re.S)
+    title = m.group(1) if m else ""
+    for phrase in SOFT_404_MARKERS:
+        if phrase in title:
+            return phrase
+    head = low[:4000]
+    for phrase in SOFT_404_MARKERS:
+        if phrase in head:
+            return phrase
+    return None
+
+
+def classify_link(url, status, body, error=None):
+    """Pure classifier (no network) → (verdict, reason), verdict ∈
+    {"ok","blocked","broken"}. It's deliberately side-effect-free so it can be
+    unit tested offline; check_links() feeds it live (status, body, error)."""
+    blocks = _host_blocks_bots(url)
+    if error is not None:
+        msg = str(error).lower()
+        timed_out = "timed out" in msg or "timeout" in msg
+        if blocks and (timed_out or "forbidden" in msg or "403" in msg):
+            return "blocked", f"{error} — bot-blocking travel domain, fine in a browser"
+        return "broken", f"could not connect: {error}"
+    if status in (403, 429, 503):
+        if blocks:
+            return "blocked", f"HTTP {status} from a bot-blocking travel domain (valid in a browser)"
+        return "broken", f"HTTP {status} (access denied / rate-limited)"
+    if status in (404, 410):
+        return "broken", f"HTTP {status} (page gone)"
+    if status is not None and 500 <= status < 600:
+        return "broken", f"HTTP {status} (server error)"
+    if status is not None and 200 <= status < 400:
+        reason = _soft_404_reason(body)
+        if reason:
+            return "broken", f'HTTP {status} but the page reads as dead ("{reason}")'
+        return "ok", f"HTTP {status}"
+    return "broken", f"unexpected response (status={status})"
+
+
+def _default_fetch(url, timeout=12):
+    """Fetch a URL like a browser would; return (status, body, error). Network
+    errors (DNS, refused, timeout) come back as the error slot, not an exception."""
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(url, method="GET", headers={
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            return status, resp.read(20000).decode("utf-8", "replace"), None
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read(20000).decode("utf-8", "replace")
+        except Exception:
+            pass
+        return e.code, body, None
+    except Exception as e:  # URLError (DNS / refused), socket timeout, etc.
+        return None, "", e
+
+
+def collect_links(wb_or_path):
+    """Map every hyperlink in the workbook to where it lives:
+    {url: [{"sheet","cell","text"}, ...]}. URLs are deduplicated, so a link that
+    appears on several rows is only fetched once."""
+    wb = load_workbook(wb_or_path) if isinstance(wb_or_path, (str, os.PathLike)) else wb_or_path
+    links = {}
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for c in row:
+                if c.hyperlink and c.hyperlink.target:
+                    links.setdefault(c.hyperlink.target, []).append(
+                        {"sheet": ws.title, "cell": c.coordinate, "text": c.value})
+    return links
+
+
+def check_links(wb_or_path, *, fetcher=None, max_workers=8):
+    """Fetch and classify every hyperlink in the workbook. Returns a report:
+
+        {"checked": int,
+         "ok":      [ {url, locations} ... ],
+         "blocked": [ {url, reason, locations} ... ],   # accepted, no fix needed
+         "broken":  [ {url, reason, locations} ... ]}   # each needs a fix-task
+
+    `fetcher(url) -> (status, body, error)` is injectable so the classification
+    can be unit tested offline; the default hits the network with a browser
+    User-Agent. Drive fix-tasks off the "broken" list only — "blocked" is
+    informational (a bot-blocking site, fine for a human in a browser)."""
+    fetcher = fetcher or _default_fetch
+    links = collect_links(wb_or_path)
+    report = {"checked": len(links), "ok": [], "blocked": [], "broken": []}
+
+    def _one(url):
+        status, body, error = fetcher(url)
+        verdict, reason = classify_link(url, status, body, error)
+        return url, verdict, reason
+
+    urls = list(links.keys())
+    if max_workers and max_workers > 1 and len(urls) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            results = list(ex.map(_one, urls))
+    else:
+        results = [_one(u) for u in urls]
+
+    for url, verdict, reason in results:
+        entry = {"url": url, "locations": links[url]}
+        if verdict != "ok":
+            entry["reason"] = reason
+        report[verdict].append(entry)
+    return report
+
+
 # ── Recalc + finalize ────────────────────────────────────────────────────────
 def _find_recalc():
     for p in (

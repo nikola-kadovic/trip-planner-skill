@@ -31,6 +31,7 @@ API (all cell helpers return the cell so you can tweak further):
 - **Per-person:** `tx.per_person(total_cell, travelers_cell)` → `'=F12/$C$4'`, for the per-person column.
 - Currency: `tx.money("CAD")` → a ready number format; extend `tx._CURRENCY_SYMBOL` for exotic currencies.
 - Close-out: `tx.finalize(wb, out_path, link_checks=[…])` — see Final checks below.
+- **Live link check:** `tx.check_links(path)` → `{checked, ok, blocked, broken}`; each `broken`/`blocked` entry carries `reason` + `locations` (sheet/cell) so a fix-task knows exactly what to patch. `tx.collect_links(path)` and `tx.classify_link(url, status, body, error)` are the underlying pieces (the classifier is pure/offline-testable).
 
 Palette/format constants live in the module and follow the semantics in the Palette section above (title=DARK, sections=MID, zebra=LIGHT, chosen=CHOSEN; inputs blue, formulas black, cross-sheet refs green, hyperlinks blue-underlined). Font is Arial throughout.
 
@@ -107,4 +108,18 @@ Then **gate on the report — do not present a workbook that fails either check:
 - `report["recalc_ok"]` must be `True` (zero formula errors). If `False`, read `report["recalc_output"]`, fix the formulas, and re-finalize. (`None` means `recalc.py` wasn't found — run the `xlsx` skill's recalc manually.)
 - Spot-check that cross-sheet links resolved and that non-home-currency conversions look right.
 
-Once both checks pass, `present_files` the path with a short summary (total, per person, chosen picks, and a note that the link audit passed).
+### Link sanity check (live) — run after the coverage gate passes
+
+`tx.finalize()` only proves every priced row *has* a link. Before presenting, prove each link *works*:
+
+```python
+links = tx.check_links(report["path"])   # fetches every hyperlink, classifies each
+```
+
+`check_links` returns `{"checked", "ok", "blocked", "broken"}`:
+- **blocked** — a bot-blocking travel site (Booking.com, Expedia, Tripadvisor, lastminute.com, Airbnb, GetYourGuide, …) answered the automated request with a 403/429/timeout. Nothing to fix — the link is valid for a human in a browser. Report the count; accept it.
+- **broken** — a real failure: DNS/connection error, 404/410, a 5xx, or a 200 whose *content* reads as a dead page (`SOFT_404_MARKERS`: "page not found", "no longer available", "no results found", …).
+
+**Gate: `links["broken"]` must be empty before presenting.** For each broken entry, spin up a fix-task that opens the URL, diagnoses *why* it failed (expired/wrong deep link, bad params, moved page, or a URL-builder bug), recovers a working replacement with `tx.link(...)` (deep link, or a search URL for that exact item on the same provider), re-saves, and re-runs `tx.check_links`. Loop until clear. Fixing the underlying builder bug — not just the one cell — stops the same break recurring across rows.
+
+Once all checks pass, `present_files` the path with a short summary (total, per person, chosen picks, and a note that the link coverage audit + live link check passed, plus any bot-blocked links that were accepted).
